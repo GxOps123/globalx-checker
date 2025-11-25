@@ -6,21 +6,21 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import pytz
 import re
-import concurrent.futures # Import for multi-threading
+import concurrent.futures
 
-# --- PAGE CONFIGURATION ---
-st.set_page_config(page_title="Global X Monitor", page_icon="⚡", layout="wide")
-st.title("⚡ Global X Australia - Speed Monitor")
+# --- PAGE CONFIG ---
+st.set_page_config(page_title="Global X Monitor", page_icon="📊", layout="wide")
+st.title("📊 Global X Australia - Daily Data Monitor")
 st.markdown("Live tracking of NAV, Performance, Holdings, and Distribution updates.")
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 BASE_URL = "https://www.globalxetfs.com.au/funds/"
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 SYD_TZ = pytz.timezone('Australia/Sydney')
 EXCEPTION_FUNDS = ['USTB', 'BCOM', 'USIG']
 FORCE_LIST = ['ETPMAG', 'ETPMPD', 'ETPMPM', 'ETPMPT']
 
-# --- CORE LOGIC (V18 STABLE) ---
+# --- CORE LOGIC (V21 STRICT ENGLISH & NAV LOGIC) ---
 def parse_date(text):
     try:
         # Regex to extract date format like "24 Nov 2025"
@@ -49,7 +49,7 @@ def get_last_bd(d, n):
         if curr.weekday() < 5: c += 1
     return curr
 
-@st.cache_data(ttl=3600) # Cache the fund list for 1 hour
+@st.cache_data(ttl=3600)
 def get_all_tickers():
     try:
         r = requests.get(BASE_URL, headers=HEADERS)
@@ -61,45 +61,52 @@ def get_all_tickers():
     except: return FORCE_LIST + ['ACDC', 'BANK']
 
 def check_fund(ticker):
-    # This function is executed in parallel threads
     url = f"{BASE_URL}{ticker.lower()}/"
     exp_nav, exp_hold, exp_dist = get_expectations(ticker)
+    # Important: NAV cannot be TODAY. It must be T-1 or older.
+    today_date = datetime.now(SYD_TZ).date()
+
     report = {'Ticker': ticker, 'NAV': 'Checking...', 'Holdings': 'Checking...', 'Perf': 'Checking...', 'Dist': 'Checking...'}
     
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(r.text, 'html.parser')
 
-        # Gather all text nodes that look like dates
         all_dates = []
         candidates = soup.find_all(['span', 'div'])
         for c in candidates:
             if "as of" in c.get_text().lower():
                 dt, s = parse_date(c.get_text())
                 if dt:
-                    # Capture context (Parent + Grandparent text) to identify what date this is
+                    # Get deep context (Parent + Grandparent text)
                     pt = c.parent.parent.get_text(" ", strip=True).lower() if c.parent and c.parent.parent else ""
                     gt = c.parent.parent.parent.get_text(" ", strip=True).lower() if c.parent and c.parent.parent and c.parent.parent.parent else ""
                     all_dates.append({'dt': dt, 's': s, 'ctx': pt + " " + gt})
 
         nav_res, perf_res, hold_res = None, None, None
         
-        # 1. NAV Check (Look for 'nav' keywords)
+        # 1. NAV Logic (STRICT)
+        # - Must contain "NAV" keywords
+        # - Must NOT contain "Holding" keywords
+        # - Date CANNOT be Today (NAV is always T-1 or T-2)
         for x in all_dates:
-            if "nav" in x['ctx'] or "net asset" in x['ctx']:
+            ctx = x['ctx']
+            if ("nav" in ctx or "net asset" in ctx) and ("holding" not in ctx) and ("characteristics" not in ctx):
+                if x['dt'] == today_date:
+                    continue # Skip if date is Today (False Positive from Holdings)
                 if nav_res is None or x['dt'] > nav_res['dt']: nav_res = x
         
-        # 2. Performance Check (Look for 'return' keywords)
+        # 2. Performance Logic
         for x in all_dates:
             if "return" in x['ctx']:
                 if perf_res is None or x['dt'] > perf_res['dt']: perf_res = x
 
-        # 3. Holdings Check (Look for 'holding' keywords)
+        # 3. Holdings Logic
         for x in all_dates:
             if ("holding" in x['ctx'] or "characteristics" in x['ctx']) and "return" not in x['ctx']:
                 if hold_res is None or x['dt'] > hold_res['dt']: hold_res = x
 
-        # Assign Results with Logic Checks
+        # Formatting Results
         if nav_res: report['NAV'] = f"✅ {nav_res['s']}" if nav_res['dt'] >= exp_nav else f"🔴 {nav_res['s']} (Late)"
         else: report['NAV'] = "⚠️ Missing"
 
@@ -109,7 +116,7 @@ def check_fund(ticker):
         if hold_res: report['Holdings'] = f"✅ {hold_res['s']}" if hold_res['dt'] >= exp_hold else f"🔴 {hold_res['s']} (Late)"
         else: report['Holdings'] = "⚠️ Missing"
 
-        # Distribution Check (Simple text search)
+        # Distribution Check
         exp_s = exp_dist.strftime('%d %b %Y')
         if exp_s in soup.get_text(): report['Dist'] = f"✅ {exp_s}"
         else: report['Dist'] = "⚠️ Missing"
@@ -117,10 +124,10 @@ def check_fund(ticker):
     except: report['NAV'] = "❌ Error"
     return report
 
-# --- SIDEBAR & EXECUTION ---
+# --- UI EXECUTION ---
 with st.sidebar:
     st.header("Controls")
-    if st.button("🚀 RUN FAST CHECK", type="primary"):
+    if st.button("🚀 RUN CHECK", type="primary"):
         run_check = True
     else:
         run_check = False
@@ -133,25 +140,19 @@ with st.sidebar:
 
 if run_check:
     funds = get_all_tickers()
-    st.toast(f"Found {len(funds)} funds. Speed scanning...")
+    st.toast(f"Found {len(funds)} funds. Scanning...")
     
     results = []
-    
-    # --- MULTI-THREADING EXECUTION ---
-    # Using 10 workers for faster processing
+    # Using Multi-threading
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         future_to_url = {executor.submit(check_fund, t): t for t in funds}
-        # Iterate over completed futures
         for future in concurrent.futures.as_completed(future_to_url):
             data = future.result()
             results.append(data)
     
-    # Sort results alphabetically by Ticker
     results = sorted(results, key=lambda x: x['Ticker'])
-    
     df = pd.DataFrame(results)
     
-    # Apply Styling logic
     def style_rows(val):
         s = str(val)
         if '🔴' in s: return 'background-color: #ffe6e6; color: #cc0000; font-weight: bold'
@@ -162,4 +163,4 @@ if run_check:
     st.dataframe(df.style.applymap(style_rows), use_container_width=True, height=1000)
     st.success("✨ Check Complete!")
 else:
-    st.info("👋 Ready. Click the button in the sidebar to start scanning.")
+    st.info("👋 Ready.")
